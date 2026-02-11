@@ -53,7 +53,64 @@ This file documents every hyperparameter choice with scientific rationale.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Edge Semantics — Gated Propagation Control
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Edge semantics control how regulatory/signaling edges affect metabolic
+# simulation. See gnn-calibrator.md "Edge Semantics: Gated Propagation".
+#
+# - METABOLIC_ANCHOR: Edges that can affect simulation (Vmax, Km)
+#   Examples: CREB→TPH2, NRF2→SOD, HIF1A→LDHA
+#   simulation_affecting = True
+#
+# - LATENT_CONTEXT: Hidden state only, no direct metabolic propagation
+#   Examples: ARNTL→PER1, CLOCK→CRY1 (circadian loops)
+#   simulation_affecting = False
+#
+# - EXCLUDED: Not in GNN, provenance/reference only
+#   Examples: variant_outcomes (explainability data)
+#
+# Enforced rule: Only METABOLIC_ANCHOR edges can have simulation_affecting=True
+
+
+class EdgeSemantic(Enum):
+    """Semantic classification for regulatory/signaling edges.
+
+    Controls gated propagation from signaling/TF layers into metabolic
+    enzyme predictions. See gnn-calibrator.md for full documentation.
+    """
+
+    METABOLIC_ANCHOR = "metabolic_anchor"
+    """TF/signaling edges that directly affect pathway-relevant enzymes.
+
+    Inclusion criteria:
+    1. Edge must directly affect a pathway-relevant enzyme or transporter
+    2. Evidence must be human-backed (PMID-sourced, not inferred)
+    3. Timescale must be compatible with metabolic simulation
+
+    Examples: CREB→TPH2, NRF2→SOD, HIF1A→LDHA, SREBP→lipogenic enzymes
+    """
+
+    LATENT_CONTEXT = "latent_context"
+    """Context edges for multi-hop reasoning; hidden state only.
+
+    These edges update node embeddings during message passing but are
+    gated out before enzyme Vmax/Km predictions. Useful for capturing
+    biological context without injecting noise into metabolic outputs.
+
+    Examples: ARNTL→PER1, CLOCK→CRY1 (circadian gene loops)
+    """
+
+    EXCLUDED = "excluded"
+    """Reference/provenance data only; not loaded into GNN.
+
+    Examples: variant_outcomes.jsonl (for explainability, not training)
+    """
 
 
 # ═══════════════════════════════════════════════════════════════════════════

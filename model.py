@@ -161,8 +161,8 @@ import torch.nn as nn
 
 import dgl
 
-from .config import ModelConfig
-from .graph import PHYSICS_ETYPES, LEARNED_ETYPES
+from .config import ModelConfig, EdgeSemantic
+from .graph import PHYSICS_ETYPES, LEARNED_ETYPES, EDGE_SEMANTICS
 from .layers import KineticConv, LearnedConv, EdgeHead, ConfidenceHead
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -311,6 +311,7 @@ class PathwayGNN(nn.Module):
         -------
         dict with keys:
             # Hidden states (per-edge predictions)
+            # NOTE: LATENT_CONTEXT edges have hidden=0 (gated out)
             modulates_hidden  : (N_modulates_edges,) — allosteric effects
             regulates_hidden  : (N_regulates_edges,) — enzyme regulation strength
             signaling_hidden  : (N_signaling_edges,) — signal multipliers
@@ -322,12 +323,26 @@ class PathwayGNN(nn.Module):
             signaling_conf    : (N_signaling_edges,) — prediction confidence
             bridges_conf      : (N_bridges_edges,) — prediction confidence
 
+            # Edge semantics (gated propagation control)
+            # 0 = METABOLIC_ANCHOR (affects simulation)
+            # 1 = LATENT_CONTEXT (context only, hidden=0)
+            modulates_semantic : (N_modulates_edges,) — semantic labels
+            regulates_semantic : (N_regulates_edges,) — semantic labels
+            signaling_semantic : (N_signaling_edges,) — semantic labels
+            bridges_semantic   : (N_bridges_edges,) — semantic labels
+
             # Audit/traceability
             node_embeddings   : dict[ntype → (N, hidden_dim)] — final embeddings
             attention_weights : dict[etype → (N_edges, num_heads)] — attention
 
         Note: SNP personalization is handled outside the GNN via lookup tables.
         See personalization-architecture.md for the wild type GNN + SNP lookup design.
+
+        Edge Semantics:
+        - METABOLIC_ANCHOR edges produce full hidden state outputs
+        - LATENT_CONTEXT edges have hidden=0 (gated out at output stage)
+        - Both participate in message passing for multi-hop reasoning
+        See gnn-calibrator.md "Edge Semantics: Gated Propagation" for details.
         """
         # -- 1. Project raw features to hidden dim ----------------------------
         # Each node type has its own input projection to shared hidden_dim.
@@ -406,11 +421,26 @@ class PathwayGNN(nn.Module):
         head: EdgeHead,
         name: str,
     ) -> dict[str, torch.Tensor]:
-        """Predict hidden states for a learned edge type."""
+        """Predict hidden states for a learned edge type with semantic gating.
+
+        Edge Semantics (Gated Propagation):
+        - METABOLIC_ANCHOR edges: Full hidden state output (affects simulation)
+        - LATENT_CONTEXT edges: Hidden state zeroed (context only, no simulation effect)
+
+        The semantic is stored in edge data as "semantic" field:
+        - 0 = METABOLIC_ANCHOR (simulation_affecting=True)
+        - 1 = LATENT_CONTEXT (simulation_affecting=False)
+
+        See gnn-calibrator.md "Edge Semantics: Gated Propagation" for details.
+        """
         canonical = (stype, etype, dtype)
         if g.num_edges(canonical) == 0:
             empty = torch.tensor([], device=h_dict[stype].device)
-            return {f"{name}_hidden": empty, f"{name}_conf": empty}
+            return {
+                f"{name}_hidden": empty,
+                f"{name}_conf": empty,
+                f"{name}_semantic": empty,
+            }
 
         src, dst = g.edges(etype=canonical)
         src_h = h_dict[stype][src]
@@ -419,7 +449,39 @@ class PathwayGNN(nn.Module):
         hidden = head(src_h, dst_h)
         conf = self.confidence_heads[name](src_h, dst_h)
 
-        return {f"{name}_hidden": hidden, f"{name}_conf": conf}
+        # -- Apply semantic gating ------------------------------------------------
+        # LATENT_CONTEXT edges (semantic=1) have their hidden states zeroed.
+        # They still participate in message passing (updating node embeddings),
+        # but their outputs don't affect the Rust simulation.
+        #
+        # This implements the gated propagation design:
+        # - Hidden-state propagation captures multi-hop crosstalk (during MP)
+        # - Metabolic outputs are constrained to anchor-enabled routes (here)
+        if "semantic" in g.edges[canonical].data:
+            semantic = g.edges[canonical].data["semantic"]
+            # Create mask: 1.0 for METABOLIC_ANCHOR (0), 0.0 for LATENT_CONTEXT (1)
+            anchor_mask = (semantic == 0).float()
+            hidden = hidden * anchor_mask
+            # Confidence is also zeroed for LATENT_CONTEXT (no prediction to trust)
+            conf = conf * anchor_mask
+        else:
+            # Fallback: use default semantic from EDGE_SEMANTICS
+            default_semantic = EDGE_SEMANTICS.get(etype, EdgeSemantic.LATENT_CONTEXT)
+            if default_semantic == EdgeSemantic.LATENT_CONTEXT:
+                hidden = hidden * 0.0
+                conf = conf * 0.0
+            semantic = torch.full(
+                (hidden.shape[0],),
+                0 if default_semantic == EdgeSemantic.METABOLIC_ANCHOR else 1,
+                dtype=torch.long,
+                device=hidden.device,
+            )
+
+        return {
+            f"{name}_hidden": hidden,
+            f"{name}_conf": conf,
+            f"{name}_semantic": semantic,
+        }
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -165,7 +165,7 @@ from typing import Any
 import dgl
 import torch
 
-from .config import DataConfig
+from .config import DataConfig, EdgeSemantic
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +187,73 @@ LEARNED_ETYPES = [
 ]
 
 ALL_ETYPES = PHYSICS_ETYPES + LEARNED_ETYPES
+
+# ---------------------------------------------------------------------------
+# Edge Semantics — Gated Propagation Control
+# ---------------------------------------------------------------------------
+#
+# Maps edge types to their semantic classification for gated propagation.
+# See gnn-calibrator.md "Edge Semantics: Gated Propagation" for details.
+#
+# - METABOLIC_ANCHOR: Can affect simulation (Vmax, Km)
+# - LATENT_CONTEXT: Hidden state only, no metabolic propagation
+#
+# Physics edges are always METABOLIC_ANCHOR (they define the core simulation).
+# Learned edges are classified based on their biological relevance to
+# metabolic enzyme activity.
+
+EDGE_SEMANTICS: dict[str, EdgeSemantic] = {
+    # Physics edges — always metabolic anchor (core simulation)
+    "catalyzes": EdgeSemantic.METABOLIC_ANCHOR,
+    "substrate_of": EdgeSemantic.METABOLIC_ANCHOR,
+    "produces": EdgeSemantic.METABOLIC_ANCHOR,
+    "cofactor_for": EdgeSemantic.METABOLIC_ANCHOR,
+    # Learned edges — classified by metabolic relevance
+    "modulates": EdgeSemantic.METABOLIC_ANCHOR,      # Direct enzyme modulation
+    "signaling": EdgeSemantic.METABOLIC_ANCHOR,      # Crosstalk affects enzyme activity
+    "bridges": EdgeSemantic.METABOLIC_ANCHOR,        # Cofactor saturation → enzyme
+    "transports_to": EdgeSemantic.METABOLIC_ANCHOR,  # Compartment transport
+    # Regulates: LATENT_CONTEXT by default (circadian TF→gene loops)
+    # Per-edge overrides are in REGULATES_ANCHOR_EDGES below.
+    "regulates": EdgeSemantic.LATENT_CONTEXT,
+}
+
+# ---------------------------------------------------------------------------
+# Curated METABOLIC_ANCHOR regulates edges
+# ---------------------------------------------------------------------------
+#
+# These TF→enzyme edges have direct metabolic relevance and should affect
+# the simulation (Vmax/Km). All other regulates edges remain LATENT_CONTEXT
+# (context for multi-hop reasoning, but gated out at output stage).
+#
+# Inclusion criteria (from gnn-calibrator.md):
+#   1. Edge must directly affect a pathway-relevant enzyme or transporter
+#   2. Evidence must be human-backed (PMID-sourced, not inferred)
+#   3. Timescale must be compatible with metabolic simulation
+#
+# Format: frozenset of (tf_id, target_gene_id) tuples
+
+REGULATES_ANCHOR_EDGES: frozenset[tuple[str, str]] = frozenset({
+    # AHR (Aryl Hydrocarbon Receptor) → Xenobiotic/drug-metabolizing enzymes
+    # AHR regulates Phase I/II metabolism enzymes - critical for drug response
+    ("AHR", "CYP1A1"),   # Cytochrome P450 - drug/toxin metabolism
+    ("AHR", "CYP1A2"),   # Cytochrome P450 - caffeine, theophylline metabolism
+    ("AHR", "CYP1B1"),   # Cytochrome P450 - estrogen metabolism
+    ("AHR", "CYP2B6"),   # Cytochrome P450 - drug metabolism
+    ("AHR", "UGT1A1"),   # UDP-glucuronosyltransferase - bilirubin conjugation
+    ("AHR", "AFMID"),    # Arylformamidase - kynurenine pathway
+    ("AHR", "ALDH3A1"),  # Aldehyde dehydrogenase - aldehyde detoxification
+
+    # NR3C1 (Glucocorticoid Receptor) → Metabolic enzymes
+    ("NR3C1", "H6PD"),   # Hexose-6-phosphate dehydrogenase - cortisol metabolism
+
+    # NR1H4 (FXR - Farnesoid X Receptor) → Bile acid metabolism enzymes
+    ("NR1H4", "FABP6"),  # Fatty acid binding protein - bile acid transport
+    ("NR1H4", "UGT2B4"), # UDP-glucuronosyltransferase - bile acid conjugation
+
+    # CLOCK → Metabolically-relevant targets (not just circadian genes)
+    ("CLOCK", "NAMPT"),  # Nicotinamide phosphoribosyltransferase - NAD+ biosynthesis
+})
 
 # ---------------------------------------------------------------------------
 # Edge Feature Dimensions (for LearnedConv)
@@ -447,7 +514,10 @@ def build_graph(cfg: DataConfig | None = None) -> tuple[dgl.DGLHeteroGraph, Grap
     mod_s, mod_d, mod_idx_to_src, mod_idx_to_dst, mod_edge_feats = _modulates_edges(
         mod_recs, reg_kinetics_recs, inhibitor_recs, met_map, enz_map
     )
-    reg_s, reg_d = _filtered_pairs(reg_recs, "tf_id", "target_gene_id", enz_map, enz_map)
+    # Regulates: use _filtered_pairs_with_ids so we can tag per-edge semantics
+    reg_s, reg_d, reg_idx_to_src, reg_idx_to_dst = _filtered_pairs_with_ids(
+        reg_recs, "tf_id", "target_gene_id", enz_map, enz_map
+    )
 
     # Signaling: signal_substance → bridge_mediator (via target_bridge_id lookup)
     # P0: Now includes edge features for quantitative crosstalk modeling
@@ -498,8 +568,52 @@ def build_graph(cfg: DataConfig | None = None) -> tuple[dgl.DGLHeteroGraph, Grap
     # P1: Transport edges: compartment transport features (14 dims)
     g.edges[("metabolite", "transports_to", "metabolite")].data["feat"] = trans_edge_feats
 
+    # -- Attach edge semantics (gated propagation control) ---------------------
+    # Each edge gets a semantic label: METABOLIC_ANCHOR or LATENT_CONTEXT.
+    # METABOLIC_ANCHOR edges can affect simulation (Vmax, Km).
+    # LATENT_CONTEXT edges update hidden states but don't propagate to outputs.
+    #
+    # Semantic is stored as integer: 0 = METABOLIC_ANCHOR, 1 = LATENT_CONTEXT
+    # This enables efficient masking during forward pass.
+    SEMANTIC_TO_INT = {
+        EdgeSemantic.METABOLIC_ANCHOR: 0,
+        EdgeSemantic.LATENT_CONTEXT: 1,
+    }
+    anchor_count = 0
+    for stype, etype, dtype in ALL_ETYPES:
+        num_edges = g.num_edges((stype, etype, dtype))
+        if num_edges > 0:
+            if etype == "regulates":
+                # Per-edge semantic for regulates based on REGULATES_ANCHOR_EDGES
+                semantic_arr = []
+                for i in range(num_edges):
+                    tf_id = reg_idx_to_src.get(i, "")
+                    target_id = reg_idx_to_dst.get(i, "")
+                    if (tf_id, target_id) in REGULATES_ANCHOR_EDGES:
+                        semantic_arr.append(SEMANTIC_TO_INT[EdgeSemantic.METABOLIC_ANCHOR])
+                        anchor_count += 1
+                    else:
+                        semantic_arr.append(SEMANTIC_TO_INT[EdgeSemantic.LATENT_CONTEXT])
+                g.edges[(stype, etype, dtype)].data["semantic"] = torch.tensor(
+                    semantic_arr, dtype=torch.long
+                )
+            else:
+                # Default semantic for non-regulates edges
+                semantic = EDGE_SEMANTICS.get(etype, EdgeSemantic.LATENT_CONTEXT)
+                semantic_int = SEMANTIC_TO_INT[semantic]
+                g.edges[(stype, etype, dtype)].data["semantic"] = torch.full(
+                    (num_edges,), semantic_int, dtype=torch.long
+                )
+
     for etype, (s, _) in graph_data.items():
-        logger.info("  %s: %d edges", etype[1], len(s))
+        if etype[1] == "regulates":
+            logger.info(
+                "  %s: %d edges (%d metabolic_anchor, %d latent_context)",
+                etype[1], len(s), anchor_count, len(s) - anchor_count
+            )
+        else:
+            semantic = EDGE_SEMANTICS.get(etype[1], EdgeSemantic.LATENT_CONTEXT)
+            logger.info("  %s: %d edges (%s)", etype[1], len(s), semantic.value)
 
     # -- Build kinetics lookup for enzyme features ---------------------------
     kinetics = _load_jsonl(cfg.kinetics_path)
