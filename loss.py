@@ -243,6 +243,7 @@ def hidden_state_loss(
     outputs: dict[str, Any],
     targets: dict[str, torch.Tensor],
     cfg: ModelConfig | None = None,
+    physics_residual: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Compute the full loss for hidden state inference.
 
@@ -268,10 +269,10 @@ def hidden_state_loss(
         - regulates_hidden: Tensor[num_regulates] — regulatory effects ∈ [0, 1]
         - signaling_hidden: Tensor[num_signaling] — pathway multipliers ∈ [0.5, 2]
         - bridges_hidden: Tensor[num_bridges] — cofactor saturations ∈ [0, 1]
-        - affects_hidden: Tensor[num_affects] — SNP effects ∈ [0, 1] (P0)
+        - transports_to_hidden: Tensor[num_transports] — transport multipliers ∈ [0, 2]
         - *_conf: Tensor — confidence scores ∈ [0, 1] for each edge type
     targets : dict of ground-truth hidden states
-        Keys: modulates, regulates, signaling, bridges, affects
+        Keys: modulates, regulates, signaling, bridges, transports_to
         - For unsupervised training: targets derived from Rust simulation
         - For supervised training: targets from experimental data
     cfg : ModelConfig (for loss weights)
@@ -310,8 +311,8 @@ def hidden_state_loss(
     # - Reference: Bishop (2006) "Pattern Recognition" Ch. 1.2.5
     # ─────────────────────────────────────────────────────────────────────────
     l_pred = torch.tensor(0.0, device=_get_device(outputs))
-    # All learned edge types, including P0 affects (SNP→enzyme personalization)
-    edge_types = ["modulates", "regulates", "signaling", "bridges", "affects"]
+    # Learned edge types currently emitted by PathwayGNN.
+    edge_types = ["modulates", "regulates", "signaling", "bridges", "transports_to"]
 
     for etype in edge_types:
         pred = outputs.get(f"{etype}_hidden")
@@ -347,6 +348,17 @@ def hidden_state_loss(
     # TODO: Implement once pathway edge annotations are available
 
     # ─────────────────────────────────────────────────────────────────────────
+    # 3b. Physics Residual Loss (optional)
+    #
+    # This term should be computed from flux conservation / stoichiometric
+    # imbalance by the training loop and passed in as `physics_residual`.
+    # We keep it explicit to make mass-balance penalties auditable.
+    # ─────────────────────────────────────────────────────────────────────────
+    l_physics = torch.tensor(0.0, device=_get_device(outputs))
+    if physics_residual is not None:
+        l_physics = torch.mean(physics_residual ** 2)
+
+    # ─────────────────────────────────────────────────────────────────────────
     # 4. Confidence Calibration Loss
     #
     # L_conf = MSE(confidence, accuracy)
@@ -367,7 +379,7 @@ def hidden_state_loss(
         "regulates": cfg.regulates_range[1] - cfg.regulates_range[0],
         "signaling": cfg.signaling_range[1] - cfg.signaling_range[0],
         "bridges": cfg.bridge_range[1] - cfg.bridge_range[0],
-        "affects": cfg.affects_range[1] - cfg.affects_range[0],  # P0: SNP effects
+        "transports_to": cfg.transport_range[1] - cfg.transport_range[0],
     }
 
     for etype in edge_types:
@@ -387,6 +399,7 @@ def hidden_state_loss(
     # -------------------------------------------------------------------------
     total = (
         l_pred
+        + cfg.lambda_physics * l_physics
         + cfg.lambda_smooth * l_smooth
         + cfg.lambda_bridge * l_bridge
         + cfg.lambda_confidence * l_conf
@@ -394,6 +407,7 @@ def hidden_state_loss(
 
     breakdown = {
         "pred": l_pred.item(),
+        "physics": l_physics.item(),
         "smooth": l_smooth.item(),
         "bridge": l_bridge.item(),
         "confidence": l_conf.item(),
@@ -407,10 +421,9 @@ def _get_device(outputs: dict[str, Any]) -> torch.device:
     """Get device from first non-empty tensor in outputs."""
     for key in [
         "modulates_hidden", "regulates_hidden", "signaling_hidden",
-        "bridges_hidden", "affects_hidden"  # P0: SNP→enzyme
+        "bridges_hidden", "transports_to_hidden"
     ]:
         t = outputs.get(key)
         if t is not None and hasattr(t, "device"):
             return t.device
     return torch.device("cpu")
-

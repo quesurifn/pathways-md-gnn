@@ -18,7 +18,7 @@ PathwayGNN — Single heterogeneous GNN for hidden state inference.
 #       • regulates_hidden: regulatory strength [0, 1]
 #       • signaling_hidden: pathway multipliers [0.5, 2.0]
 #       • bridges_hidden: cofactor saturations [0, 1]
-#       • transports_to_hidden: compartment transport [0, 1]
+#       • transports_to_hidden: compartment transport [0, 2]
 #   - Confidence scores for each prediction [0, 1]
 #   - Attention weights for audit trace
 #
@@ -171,8 +171,8 @@ from .layers import KineticConv, LearnedConv, EdgeHead, ConfidenceHead
 #
 # These dimensions encode node-specific features extracted from seed data:
 #
-#   enzyme: 4 features
-#     [vmax, km, confidence, variant_modifier]
+#   enzyme: 6 features
+#     [vmax, km, confidence, baseline, brain_expr_norm, brain_to_systemic_ratio]
 #     - vmax: Maximum reaction velocity (normalized)
 #     - km: Michaelis constant (normalized)
 #     - confidence: Data quality score
@@ -194,7 +194,7 @@ from .layers import KineticConv, LearnedConv, EdgeHead, ConfidenceHead
 #
 # Reference: graph.py build_graph() for feature construction
 # ═══════════════════════════════════════════════════════════════════════════
-_RAW_DIMS = {"enzyme": 4, "metabolite": 2, "reaction": 2}
+_RAW_DIMS = {"enzyme": 6, "metabolite": 2, "reaction": 2}
 
 
 class PathwayGNN(nn.Module):
@@ -260,6 +260,11 @@ class PathwayGNN(nn.Module):
         self.input_proj = nn.ModuleDict({
             ntype: nn.Linear(raw_d, h) for ntype, raw_d in _RAW_DIMS.items()
         })
+        # Per-node-type context projection for request-conditioned inference.
+        # Context is a single scalar channel injected by calibrate().
+        self.context_proj = nn.ModuleDict({
+            ntype: nn.Linear(1, h, bias=False) for ntype in _RAW_DIMS
+        })
 
         # -- 2. Message-passing layers (physics + learned) -------------------
         self.mp_layers = nn.ModuleList()
@@ -282,6 +287,9 @@ class PathwayGNN(nn.Module):
         self.bridges_head = EdgeHead(
             edge_input_dim, edge_head_dim, cfg.bridge_range, cfg.dropout
         )
+        self.transports_to_head = EdgeHead(
+            edge_input_dim, edge_head_dim, cfg.transport_range, cfg.dropout
+        )
 
         # NOTE: affects_head removed — SNP personalization is handled outside GNN.
         # See personalization-architecture.md for the wild type GNN + SNP lookup design.
@@ -295,6 +303,7 @@ class PathwayGNN(nn.Module):
             "regulates": ConfidenceHead(edge_input_dim, edge_head_dim, cfg.dropout),
             "signaling": ConfidenceHead(edge_input_dim, edge_head_dim, cfg.dropout),
             "bridges": ConfidenceHead(edge_input_dim, edge_head_dim, cfg.dropout),
+            "transports_to": ConfidenceHead(edge_input_dim, edge_head_dim, cfg.dropout),
         })
 
     def forward(
@@ -351,7 +360,10 @@ class PathwayGNN(nn.Module):
         for ntype, proj in self.input_proj.items():
             # Check if this node type exists in the graph
             if ntype in g.ntypes and g.num_nodes(ntype) > 0:
-                h_dict[ntype] = torch.relu(proj(g.nodes[ntype].data["feat"]))
+                h = torch.relu(proj(g.nodes[ntype].data["feat"]))
+                if "ctx" in g.nodes[ntype].data:
+                    h = h + self.context_proj[ntype](g.nodes[ntype].data["ctx"])
+                h_dict[ntype] = h
             else:
                 # Create empty tensor for missing node types
                 # This allows forward pass even when some node types have no nodes
@@ -361,7 +373,7 @@ class PathwayGNN(nn.Module):
         # -- 2. Message passing (physics + learned) ---------------------------
         # Track attention weights for all learned edge types (for audit trace)
         all_attn: dict[str, list[torch.Tensor]] = {
-            "modulates": [], "regulates": [], "signaling": [], "bridges": [],
+            "modulates": [], "regulates": [], "signaling": [], "bridges": [], "transports_to": [],
         }
         for layer in self.mp_layers:
             h_dict, layer_attn = layer(g, h_dict)
@@ -404,6 +416,10 @@ class PathwayGNN(nn.Module):
         outputs.update(self._predict_edge_hidden(
             g, "metabolite", "bridges", "enzyme",
             h_dict, self.bridges_head, "bridges"
+        ))
+        outputs.update(self._predict_edge_hidden(
+            g, "metabolite", "transports_to", "metabolite",
+            h_dict, self.transports_to_head, "transports_to"
         ))
 
         # NOTE: affects edges removed — SNP personalization is handled outside GNN.
@@ -448,6 +464,45 @@ class PathwayGNN(nn.Module):
 
         hidden = head(src_h, dst_h)
         conf = self.confidence_heads[name](src_h, dst_h)
+
+        # Residual prediction: clamp(baseline + delta, output_range)
+        #
+        # Why residualization here (and not in data pre-processing):
+        # - The edge head can stay expressive, but we explicitly anchor outputs
+        #   to mechanistic "no-effect" baselines (e.g., signaling=1, bridges=1).
+        # - This preserves interpretable baselines and limits drift in low-signal
+        #   regions while still letting the model learn corrections.
+        #
+        # References:
+        # - He et al. (2016) residual formulation H(x)=F(x)+x:
+        #   https://www.cv-foundation.org/openaccess/content_cvpr_2016/papers/He_Deep_Residual_Learning_CVPR_2016_paper.pdf
+        # - Hybrid mechanistic + residual model-error learning:
+        #   https://clima.caltech.edu/wp-content/uploads/2023/03/essoar.10509956.1.pdf
+        ranges: dict[str, tuple[float, float]] = {
+            "modulates": self.cfg.modulates_range,
+            "regulates": self.cfg.regulates_range,
+            "signaling": self.cfg.signaling_range,
+            "bridges": self.cfg.bridge_range,
+            "transports_to": self.cfg.transport_range,
+        }
+        baselines: dict[str, float] = {
+            "modulates": 0.0,
+            "regulates": 0.0,
+            "signaling": 1.0,
+            "bridges": 1.0,
+            "transports_to": 1.0,
+        }
+        lo, hi = ranges[name]
+        baseline = baselines[name]
+        # Clip learned delta before recombining with baseline. This guardrail is
+        # intentionally conservative to avoid large early-training excursions that
+        # can destabilize downstream simulation.
+        delta = torch.clamp(
+            hidden - baseline,
+            min=-self.cfg.residual_delta_clip,
+            max=self.cfg.residual_delta_clip,
+        )
+        hidden = torch.clamp(baseline + delta, min=lo, max=hi)
 
         # -- Apply semantic gating ------------------------------------------------
         # LATENT_CONTEXT edges (semantic=1) have their hidden states zeroed.

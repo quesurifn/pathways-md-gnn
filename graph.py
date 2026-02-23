@@ -348,6 +348,11 @@ class GraphMeta:
     # edge_idx → (src_metabolite_id, dst_metabolite_id)
     transport_idx_to_pair: dict[int, tuple[str, str]] = field(default_factory=dict)
 
+    # P2: receptor_id → enzyme_ids mapping for tissue-context scaling
+    receptor_to_enzyme: dict[str, list[str]] = field(default_factory=dict)
+    # enzyme_id → compact tissue context features (brain/systemic)
+    enzyme_tissue_context: dict[str, tuple[float, float]] = field(default_factory=dict)
+
 
 # ---- Helpers ---------------------------------------------------------------
 
@@ -368,9 +373,113 @@ def _safe_float(val: Any, default: float = 0.0) -> float:
         return default
 
 
+def _log_zscore_inplace(feat: torch.Tensor, col: int) -> None:
+    """Apply log1p + z-score normalization in place for a positive-valued column.
+
+    Rationale:
+    - Kinetic-style quantities (e.g., kcat, Km, Ki, concentration-like magnitudes)
+      often span orders of magnitude; log-transforming before scaling is standard.
+    - Source examples:
+      - CatPred (Nature Communications, 2025) log10-transforms kcat/Km/Ki due to
+        multi-order spread:
+        https://www.nature.com/articles/s41467-025-57215-9
+      - Enzyme parameter reliability discussion recommends geometric/log-space
+        treatment for kinetic parameter distributions:
+        https://pmc.ncbi.nlm.nih.gov/articles/PMC8746786/
+    - After log1p, z-scoring centers and scales features for faster/stabler training.
+    """
+    if feat.numel() == 0:
+        return
+    x = feat[:, col].clone()
+    x = torch.clamp(x, min=0.0)
+    x = torch.log1p(x)
+    mu = x.mean()
+    sigma = x.std(unbiased=False)
+    if torch.isfinite(sigma) and sigma > 1e-8:
+        x = (x - mu) / sigma
+    else:
+        x = x - mu
+    feat[:, col] = torch.clamp(x, min=-5.0, max=5.0)
+
+
 def _id_map(records: list[dict], key: str = "id") -> dict[str, int]:
     """Build {string_id: integer_index} from a list of dicts."""
     return {r[key]: i for i, r in enumerate(records)}
+
+
+def _build_tissue_context(
+    receptor_expression_recs: list[dict],
+    reg_recs: list[dict],
+    enz_map: dict[str, int],
+) -> tuple[dict[str, list[str]], dict[str, tuple[float, float]]]:
+    """Build receptor→enzyme mapping and per-enzyme tissue scaling features.
+
+    Returns
+    -------
+    receptor_to_enzyme:
+        receptor_id -> sorted unique enzyme ids.
+    enzyme_tissue:
+        enzyme_id -> (brain_expression_norm, brain_to_systemic_ratio).
+    """
+    expr_by_receptor: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    for rec in receptor_expression_recs:
+        rid = rec.get("receptor_id", "")
+        if not rid:
+            continue
+        tissue = (rec.get("tissue", "") or "").lower()
+        compartment = (rec.get("compartment", "") or "").lower()
+        value = _safe_float(rec.get("value"), 0.0)
+        if value <= 0:
+            continue
+
+        if tissue == "brain" or "brain" in tissue or compartment == "brain":
+            bucket = "brain"
+        elif compartment in {"systemic", "plasma"}:
+            bucket = "systemic"
+        else:
+            bucket = "other"
+        expr_by_receptor[rid][bucket].append(value)
+
+    receptor_to_enzyme: dict[str, set[str]] = defaultdict(set)
+
+    # Direct symbol identity map (receptor gene can also be enzyme in graph).
+    for rid in expr_by_receptor:
+        if rid in enz_map:
+            receptor_to_enzyme[rid].add(rid)
+
+    # Regulatory map: receptor TF -> target enzyme.
+    for rec in reg_recs:
+        src = rec.get("tf_id", "")
+        dst = rec.get("target_gene_id", "")
+        if src in expr_by_receptor and dst in enz_map:
+            receptor_to_enzyme[src].add(dst)
+
+    brain_values_all: list[float] = []
+    for rid in expr_by_receptor:
+        brain_values_all.extend(expr_by_receptor[rid].get("brain", []))
+    brain_scale = max(brain_values_all) if brain_values_all else 1.0
+
+    enzyme_tissue: dict[str, tuple[float, float]] = {}
+    for enz_id in enz_map:
+        mapped_receptors = [rid for rid, dsts in receptor_to_enzyme.items() if enz_id in dsts]
+        brain_vals: list[float] = []
+        systemic_vals: list[float] = []
+        for rid in mapped_receptors:
+            brain_vals.extend(expr_by_receptor[rid].get("brain", []))
+            systemic_vals.extend(expr_by_receptor[rid].get("systemic", []))
+
+        brain_mean = sum(brain_vals) / len(brain_vals) if brain_vals else 0.0
+        systemic_mean = sum(systemic_vals) / len(systemic_vals) if systemic_vals else 0.0
+        brain_norm = min(1.0, brain_mean / (brain_scale + 1e-12))
+        ratio = min(4.0, brain_mean / max(systemic_mean, 1e-6))
+        enzyme_tissue[enz_id] = (brain_norm, ratio)
+
+    receptor_to_enzyme_final = {
+        rid: sorted(list(dsts))
+        for rid, dsts in receptor_to_enzyme.items()
+        if dsts
+    }
+    return receptor_to_enzyme_final, enzyme_tissue
 
 
 # ---- Edge builders ---------------------------------------------------------
@@ -488,6 +597,8 @@ def build_graph(cfg: DataConfig | None = None) -> tuple[dgl.DGLHeteroGraph, Grap
     bbb_recs = _load_jsonl(cfg.edges_bbb_path)
     # P1: Load inhibitors for competitive inhibition edges
     inhibitor_recs = _load_jsonl(cfg.inhibitors_path)
+    # P2: Load receptor expression context for tissue-specific scaling
+    receptor_expression_recs = _load_jsonl(cfg.receptor_expression_path)
     # NOTE: edges_affects.jsonl is NOT loaded here - SNP personalization is
     # handled outside the GNN via lookup tables. See personalization-architecture.md.
 
@@ -531,6 +642,9 @@ def build_graph(cfg: DataConfig | None = None) -> tuple[dgl.DGLHeteroGraph, Grap
     # P1: Transport edges for compartmentalization (systemic↔brain, cytosol↔vesicle)
     trans_s, trans_d, trans_idx_to_pair, trans_edge_feats = _transport_edges(
         transport_recs, bbb_recs, met_map
+    )
+    receptor_to_enzyme, enzyme_tissue_context = _build_tissue_context(
+        receptor_expression_recs, reg_recs, enz_map
     )
 
     # -- Assemble heterograph ------------------------------------------------
@@ -628,8 +742,8 @@ def build_graph(cfg: DataConfig | None = None) -> tuple[dgl.DGLHeteroGraph, Grap
     # -- Attach node features ------------------------------------------------
     GRADE_MAP = {"A": 1.0, "B": 0.75, "C": 0.5, "D": 0.25}
 
-    # Enzyme: [baseline_km, baseline_vmax, kcat, source_grade]
-    enz_feat = torch.zeros(len(enz_map), 4)
+    # Enzyme: [baseline_km, baseline_vmax, kcat, source_grade, brain_expr_norm, brain:systemic_ratio]
+    enz_feat = torch.zeros(len(enz_map), 6)
     for enz in enzymes:
         i = enz_map[enz["id"]]
         enz_feat[i, 0] = _safe_float(enz.get("baseline_km"))
@@ -637,6 +751,17 @@ def build_graph(cfg: DataConfig | None = None) -> tuple[dgl.DGLHeteroGraph, Grap
         kin = kin_lookup.get(enz["id"], {})
         enz_feat[i, 2] = kin.get("kcat", 0.0)
         enz_feat[i, 3] = GRADE_MAP.get(enz.get("source_strength", ""), 0.25)
+        tissue = enzyme_tissue_context.get(enz["id"], (0.0, 1.0))
+        enz_feat[i, 4] = tissue[0]
+        enz_feat[i, 5] = tissue[1]
+    if cfg.normalize_node_features:
+        # Enzyme kinetics-like columns are positive and heavy-tailed.
+        # We use log1p + z-score because kinetic constants are typically
+        # distributed over multiple orders of magnitude (see _log_zscore_inplace docs).
+        _log_zscore_inplace(enz_feat, 0)
+        _log_zscore_inplace(enz_feat, 1)
+        _log_zscore_inplace(enz_feat, 2)
+        _log_zscore_inplace(enz_feat, 5)
     g.nodes["enzyme"].data["feat"] = enz_feat
 
     # Metabolite: [baseline_vol, source_grade]
@@ -645,6 +770,10 @@ def build_graph(cfg: DataConfig | None = None) -> tuple[dgl.DGLHeteroGraph, Grap
         i = met_map[met["id"]]
         met_feat[i, 0] = _safe_float(met.get("baseline_vol"))
         met_feat[i, 1] = GRADE_MAP.get(met.get("source_strength", ""), 0.25)
+    if cfg.normalize_node_features:
+        # Baseline metabolite volume/concentration-like values are also positive
+        # and can be skewed. Keep transformation consistent with enzyme features.
+        _log_zscore_inplace(met_feat, 0)
     g.nodes["metabolite"].data["feat"] = met_feat
 
     # Reaction: [reversible_flag, source_grade]
@@ -677,6 +806,8 @@ def build_graph(cfg: DataConfig | None = None) -> tuple[dgl.DGLHeteroGraph, Grap
         modulates_idx_to_src=mod_idx_to_src,
         modulates_idx_to_dst=mod_idx_to_dst,
         transport_idx_to_pair=trans_idx_to_pair,  # P1: edge idx → (src, dst) metabolite IDs
+        receptor_to_enzyme=receptor_to_enzyme,
+        enzyme_tissue_context=enzyme_tissue_context,
     )
 
     return g, meta

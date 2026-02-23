@@ -362,6 +362,35 @@ class ModelConfig:
     regulates_range: tuple[float, float] = (0.0, 1.0)     # regulatory strength
     signaling_range: tuple[float, float] = (0.0, 2.0)     # signal multiplier
     bridge_range: tuple[float, float] = (0.0, 1.0)        # cofactor saturation
+    # transports_to hidden states are treated as multiplicative transport factors.
+    # Baseline is 1.0 ("no change"), values <1 attenuate transport, values >1 amplify.
+    #
+    # Why cap at 2.0?
+    # - This is an engineering safety prior for simulation stability, not a canonical
+    #   biological universal bound.
+    # - We explicitly keep this conservative until we have enough curated transport
+    #   training targets to replace it with empirical percentile bounds.
+    #
+    # NOTE: This bound should be recalibrated from data once train/eval is in place.
+    transport_range: tuple[float, float] = (0.0, 2.0)     # transport multiplier
+
+    # Residual prediction clip for edge heads.
+    #
+    # Final hidden value is computed as:
+    #   hidden = clamp(baseline + predicted_delta, output_range)
+    #
+    # Why residuals (baseline + delta) instead of absolute prediction:
+    # - Residual formulation generally optimizes more easily than direct mapping
+    #   because the model only learns corrections to mechanistic priors.
+    # - Source: He et al. 2016 (ResNet), H(x)=F(x)+x
+    #   https://www.cv-foundation.org/openaccess/content_cvpr_2016/papers/He_Deep_Residual_Learning_CVPR_2016_paper.pdf
+    # - Source: hybrid mechanistic + learned model-error framing
+    #   https://clima.caltech.edu/wp-content/uploads/2023/03/essoar.10509956.1.pdf
+    #
+    # Why clip to 0.5:
+    # - Another engineering prior to prevent unconstrained residuals from swamping
+    #   mechanistic baselines early in training.
+    residual_delta_clip: float = 0.5
 
     # NOTE: affects_range removed — SNP personalization is handled outside GNN.
     # See personalization-architecture.md for the wild type GNN + SNP lookup design.
@@ -487,6 +516,17 @@ class DataConfig:
     seed_root: Path = Path(
         "data-experiments/data-experiments/seed/canonical"
     )
+    # Enable feature normalization by default for graph node features.
+    #
+    # Why:
+    # - Zero-mean / unit-variance style scaling improves optimizer conditioning and
+    #   convergence speed in deep nets.
+    # - Sources:
+    #   - LeCun guidance ("Efficient BackProp" lineage, summarized in NIPS tutorial)
+    #     https://media.nips.cc/Conferences/2015/tutorialslides/DL-Tutorial-NIPS2015.pdf
+    #   - BatchNorm discussion referencing normalization benefits
+    #     http://research.google.com/pubs/archive/43442.pdf
+    normalize_node_features: bool = True
 
     # =========================================================================
     # CORE ENTITIES (nodes)
@@ -674,7 +714,7 @@ class DataConfig:
         - value, units: Numeric time constants
         - substance_id → target_id
 
-        TODO: Use for time-dependent simulation.
+        ✅ INTEGRATED in Rust flux engine temporal mode.
         """
         return self.seed_root / "kinetics" / "regulatory_dynamics.jsonl"
 
@@ -688,7 +728,7 @@ class DataConfig:
         - expression_measure: RNA_nTPM
         - value: Expression level
 
-        TODO: Use for tissue-specific effect scaling.
+        ✅ INTEGRATED in graph construction for tissue-scaled enzyme features.
         """
         return self.seed_root / "core" / "receptor_expression_context.jsonl"
 
@@ -714,4 +754,3 @@ class DataConfig:
         TODO: Use for phenotype prediction supervision.
         """
         return self.seed_root / "kinetics" / "variant_outcomes.jsonl"
-
