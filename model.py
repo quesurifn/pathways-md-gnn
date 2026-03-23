@@ -1,11 +1,11 @@
 """
-PathwayGNN — Single heterogeneous GNN for hidden state inference.
+PathwayGNN — Single heterogeneous GNN for posterior correction inference.
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # WHAT THIS MODEL DOES
 # ═══════════════════════════════════════════════════════════════════════════════
 #
-# The PathwayGNN is a HIDDEN STATE INFERENCE ENGINE for metabolic pathways.
+# The PathwayGNN is a POSTERIOR CORRECTION ENGINE for metabolic pathways.
 #
 # INPUT:
 #   - Heterogeneous graph with node types: enzyme, metabolite, reaction
@@ -13,7 +13,7 @@ PathwayGNN — Single heterogeneous GNN for hidden state inference.
 #   - Edge features encoding evidence quality and biological semantics
 #
 # OUTPUT:
-#   - Hidden states on LEARNED edges (not physics edges):
+#   - Residual correction states on LEARNED edges (not physics edges):
 #       • modulates_hidden: allosteric effects [-1, +1]
 #       • regulates_hidden: regulatory strength [0, 1]
 #       • signaling_hidden: pathway multipliers [0.5, 2.0]
@@ -22,22 +22,23 @@ PathwayGNN — Single heterogeneous GNN for hidden state inference.
 #   - Confidence scores for each prediction [0, 1]
 #   - Attention weights for audit trace
 #
-# NOTE: SNP personalization is handled OUTSIDE the GNN via lookup tables.
-# The GNN learns wild type biochemistry; SNPs are post-GNN multipliers.
+# NOTE: SNP personalization is handled OUTSIDE the GNN via the DAG prior.
+# The GNN operates on a genotype-aware prior packet and predicts bounded
+# current-state corrections on top of that prior.
 # See personalization-architecture.md for the full design rationale.
 #
 # DOWNSTREAM USE:
-#   The hidden states are fed to the RUST FLUX ENGINE, which uses them
-#   as constraints in a deterministic Michaelis-Menten simulation:
+#   The correction states are fed to the RUST FLUX ENGINE, which uses them
+#   as bounded posterior adjustments in a deterministic Michaelis-Menten simulation:
 #
 #       Km_eff = Km × (1 - modulates_hidden)
 #       v = Vmax × [S] / (Km_eff + [S])
 #       (SNP multipliers are applied separately via variant_kinetics.jsonl)
 #
 # WHY THIS DESIGN:
-#   1. GNN infers what we DON'T know (hidden states)
-#   2. Rust engine encodes what we DO know (biochemistry)
-#   3. Together: physics-informed inference with interpretable outputs
+#   1. DAG prior estimates baseline mechanistic state
+#   2. GNN infers what changed today relative to that baseline
+#   3. Together: posterior correction with interpretable outputs
 #
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -158,12 +159,55 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 import dgl
 
 from .config import ModelConfig, EdgeSemantic
 from .graph import PHYSICS_ETYPES, LEARNED_ETYPES, EDGE_SEMANTICS
-from .layers import KineticConv, LearnedConv, EdgeHead, ConfidenceHead
+from .layers import KineticConv, LearnedConv, EdgeHead, ConfidenceHead, MoEEdgeHead
+from .observation_features import OBSERVATION_FEATURE_DIM
+
+WHY_TODAY_LATENT_NAMES: tuple[str, ...] = (
+    "histamine_load_today",
+    "catecholamine_clearance_stress",
+    "glutamate_gaba_instability",
+    "methyl_donor_strain",
+    "infection_like_sickness_state",
+    "circadian_disruption",
+    "sleep_pressure_disruption",
+    "absorption_impairment",
+    "acute_cofactor_depletion",
+    "transport_constraint_state",
+    "intervention_rebound_or_withdrawal",
+    "stress_hormone_load",
+)
+
+WHY_TODAY_FAMILY_NAMES: tuple[str, ...] = (
+    "histamine",
+    "stress",
+    "sleep",
+    "gi_transport",
+    "nutrient",
+    "rebound",
+    "neuro",
+    "infection_like",
+)
+
+WHY_TODAY_LATENT_TO_FAMILY: dict[str, str] = {
+    "histamine_load_today": "histamine",
+    "catecholamine_clearance_stress": "stress",
+    "glutamate_gaba_instability": "neuro",
+    "methyl_donor_strain": "nutrient",
+    "infection_like_sickness_state": "infection_like",
+    "circadian_disruption": "sleep",
+    "sleep_pressure_disruption": "sleep",
+    "absorption_impairment": "gi_transport",
+    "acute_cofactor_depletion": "nutrient",
+    "transport_constraint_state": "gi_transport",
+    "intervention_rebound_or_withdrawal": "rebound",
+    "stress_hormone_load": "stress",
+}
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Raw Feature Dimensions per Node Type (must match graph.py)
@@ -198,12 +242,13 @@ _RAW_DIMS = {"enzyme": 6, "metabolite": 2, "reaction": 2}
 
 
 class PathwayGNN(nn.Module):
-    """Single heterogeneous GNN for inverse metabolic inference.
+    """Single heterogeneous GNN for posterior metabolic correction inference.
 
     # Purpose
 
-    The PathwayGNN infers hidden states (cofactor saturations, allosteric effects)
-    from observable evidence (genetic variants, dietary patterns, lab markers).
+    The PathwayGNN infers bounded posterior corrections
+    (cofactor saturation shifts, allosteric shifts, regulation shifts)
+    from observable evidence conditioned on a DAG prior.
 
     # Architecture (SOTA Graph Transformer, 2024/2025)
 
@@ -261,10 +306,13 @@ class PathwayGNN(nn.Module):
             ntype: nn.Linear(raw_d, h) for ntype, raw_d in _RAW_DIMS.items()
         })
         # Per-node-type context projection for request-conditioned inference.
-        # Context is a single scalar channel injected by calibrate().
+        # Context is an 8-dim vector per node injected by calibrate():
+        #   [0] flux delta, [1-3] symptom burden, [4-5] lifestyle,
+        #   [6] intervention exposure, [7] genotype burden.
         self.context_proj = nn.ModuleDict({
-            ntype: nn.Linear(1, h, bias=False) for ntype in _RAW_DIMS
+            ntype: nn.Linear(8, h, bias=False) for ntype in _RAW_DIMS
         })
+        self.observation_proj = nn.Linear(OBSERVATION_FEATURE_DIM, h, bias=False)
 
         # -- 2. Message-passing layers (physics + learned) -------------------
         self.mp_layers = nn.ModuleList()
@@ -275,24 +323,76 @@ class PathwayGNN(nn.Module):
         # Input: src_h + dst_h concatenated
         edge_input_dim = h * 2
 
-        self.modulates_head = EdgeHead(
-            edge_input_dim, edge_head_dim, cfg.modulates_range, cfg.dropout
-        )
-        self.regulates_head = EdgeHead(
-            edge_input_dim, edge_head_dim, cfg.regulates_range, cfg.dropout
-        )
-        self.signaling_head = EdgeHead(
-            edge_input_dim, edge_head_dim, cfg.signaling_range, cfg.dropout
-        )
-        self.bridges_head = EdgeHead(
-            edge_input_dim, edge_head_dim, cfg.bridge_range, cfg.dropout
-        )
-        self.transports_to_head = EdgeHead(
-            edge_input_dim, edge_head_dim, cfg.transport_range, cfg.dropout
-        )
+        if cfg.use_moe_heads:
+            self.modulates_head = MoEEdgeHead(
+                edge_input_dim,
+                edge_head_dim,
+                cfg.modulates_range,
+                num_experts=cfg.enzyme_regulation_experts,
+                gate_hidden_dim=cfg.moe_gate_hidden_dim,
+                gate_feat_dim=14,
+                dropout=cfg.dropout,
+                gate_dropout=cfg.moe_gate_dropout,
+            )
+            self.regulates_head = MoEEdgeHead(
+                edge_input_dim,
+                edge_head_dim,
+                cfg.regulates_range,
+                num_experts=cfg.enzyme_regulation_experts,
+                gate_hidden_dim=cfg.moe_gate_hidden_dim,
+                gate_feat_dim=14,
+                dropout=cfg.dropout,
+                gate_dropout=cfg.moe_gate_dropout,
+            )
+            self.signaling_head = MoEEdgeHead(
+                edge_input_dim,
+                edge_head_dim,
+                cfg.signaling_range,
+                num_experts=cfg.crosstalk_signaling_experts,
+                gate_hidden_dim=cfg.moe_gate_hidden_dim,
+                gate_feat_dim=22,
+                dropout=cfg.dropout,
+                gate_dropout=cfg.moe_gate_dropout,
+            )
+            self.bridges_head = MoEEdgeHead(
+                edge_input_dim,
+                edge_head_dim,
+                cfg.bridge_range,
+                num_experts=cfg.cofactor_bridge_experts,
+                gate_hidden_dim=cfg.moe_gate_hidden_dim,
+                gate_feat_dim=11,
+                dropout=cfg.dropout,
+                gate_dropout=cfg.moe_gate_dropout,
+            )
+            self.transports_to_head = MoEEdgeHead(
+                edge_input_dim,
+                edge_head_dim,
+                cfg.transport_range,
+                num_experts=cfg.transport_context_experts,
+                gate_hidden_dim=cfg.moe_gate_hidden_dim,
+                gate_feat_dim=15,
+                dropout=cfg.dropout,
+                gate_dropout=cfg.moe_gate_dropout,
+            )
+        else:
+            self.modulates_head = EdgeHead(
+                edge_input_dim, edge_head_dim, cfg.modulates_range, cfg.dropout
+            )
+            self.regulates_head = EdgeHead(
+                edge_input_dim, edge_head_dim, cfg.regulates_range, cfg.dropout
+            )
+            self.signaling_head = EdgeHead(
+                edge_input_dim, edge_head_dim, cfg.signaling_range, cfg.dropout
+            )
+            self.bridges_head = EdgeHead(
+                edge_input_dim, edge_head_dim, cfg.bridge_range, cfg.dropout
+            )
+            self.transports_to_head = EdgeHead(
+                edge_input_dim, edge_head_dim, cfg.transport_range, cfg.dropout
+            )
 
-        # NOTE: affects_head removed — SNP personalization is handled outside GNN.
-        # See personalization-architecture.md for the wild type GNN + SNP lookup design.
+        # NOTE: affects_head removed — SNP personalization is handled in the DAG prior.
+        # See personalization-architecture.md for the baseline DAG + posterior GNN design.
 
         # -- 4. Confidence heads (one per edge type) -------------------------
         # Each learned edge type has its own confidence predictor.
@@ -305,6 +405,72 @@ class PathwayGNN(nn.Module):
             "bridges": ConfidenceHead(edge_input_dim, edge_head_dim, cfg.dropout),
             "transports_to": ConfidenceHead(edge_input_dim, edge_head_dim, cfg.dropout),
         })
+        # Global latent heads for direct bridge/signaling/crosstalk supervision.
+        # This is used for trajectory-level posterior training.
+        self.global_latent_head = nn.Sequential(
+            nn.Linear(h * 3, edge_head_dim),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(edge_head_dim, 3),
+        )
+        self.global_latent_uncertainty_head = nn.Sequential(
+            nn.Linear(h * 3, edge_head_dim),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(edge_head_dim, 3),
+        )
+        # Temporal update gate for global latent state rollout:
+        # z_t = (1-a)*z_{t-1} + a*z_raw, with a in [0,1].
+        self.global_temporal_gate = nn.Sequential(
+            nn.Linear(h * 3, edge_head_dim),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(edge_head_dim, 3),
+            nn.Sigmoid(),
+        )
+        why_today_input_dim = h * 4
+        self.why_today_latent_head = nn.Sequential(
+            nn.Linear(why_today_input_dim, edge_head_dim),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(edge_head_dim, len(WHY_TODAY_LATENT_NAMES)),
+        )
+        self.why_today_obs_only_head = nn.Sequential(
+            nn.Linear(h, edge_head_dim),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(edge_head_dim, len(WHY_TODAY_LATENT_NAMES)),
+        )
+        self.why_today_obs_gate = nn.Sequential(
+            nn.Linear(why_today_input_dim, edge_head_dim),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(edge_head_dim, len(WHY_TODAY_LATENT_NAMES)),
+        )
+        self.why_today_family_head = nn.Sequential(
+            nn.Linear(why_today_input_dim, edge_head_dim),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(edge_head_dim, len(WHY_TODAY_FAMILY_NAMES)),
+        )
+        family_to_latent = torch.zeros(len(WHY_TODAY_FAMILY_NAMES), len(WHY_TODAY_LATENT_NAMES))
+        fam_index = {name: idx for idx, name in enumerate(WHY_TODAY_FAMILY_NAMES)}
+        for latent_idx, latent_name in enumerate(WHY_TODAY_LATENT_NAMES):
+            family_to_latent[fam_index[WHY_TODAY_LATENT_TO_FAMILY[latent_name]], latent_idx] = 1.0
+        self.register_buffer("why_today_family_to_latent", family_to_latent, persistent=False)
+        self.why_today_family_bias_scale = nn.Parameter(torch.tensor(0.75))
+        self.why_today_confidence_head = nn.Sequential(
+            nn.Linear(why_today_input_dim, edge_head_dim),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(edge_head_dim, len(WHY_TODAY_LATENT_NAMES)),
+        )
+        self.posterior_gain_head = nn.Sequential(
+            nn.Linear(why_today_input_dim, edge_head_dim),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(edge_head_dim, 1),
+        )
 
     def forward(
         self,
@@ -344,8 +510,8 @@ class PathwayGNN(nn.Module):
             node_embeddings   : dict[ntype → (N, hidden_dim)] — final embeddings
             attention_weights : dict[etype → (N_edges, num_heads)] — attention
 
-        Note: SNP personalization is handled outside the GNN via lookup tables.
-        See personalization-architecture.md for the wild type GNN + SNP lookup design.
+        Note: SNP personalization is handled outside the GNN in the DAG prior.
+        See personalization-architecture.md for the baseline DAG + posterior GNN design.
 
         Edge Semantics:
         - METABOLIC_ANCHOR edges produce full hidden state outputs
@@ -371,12 +537,18 @@ class PathwayGNN(nn.Module):
                                            device=next(proj.parameters()).device)
 
         # -- 2. Message passing (physics + learned) ---------------------------
+        rel_graphs: dict[tuple[str, str, str], dgl.DGLHeteroGraph] = {}
+        for key in PHYSICS_ETYPES:
+            rel_graphs[key] = g[key]
+        for key in LEARNED_ETYPES:
+            rel_graphs[key] = g[key]
+
         # Track attention weights for all learned edge types (for audit trace)
         all_attn: dict[str, list[torch.Tensor]] = {
             "modulates": [], "regulates": [], "signaling": [], "bridges": [], "transports_to": [],
         }
         for layer in self.mp_layers:
-            h_dict, layer_attn = layer(g, h_dict)
+            h_dict, layer_attn = layer(g, h_dict, rel_graphs=rel_graphs)
             for etype, attn in layer_attn.items():
                 if attn is not None:
                     all_attn[etype].append(attn)
@@ -393,6 +565,50 @@ class PathwayGNN(nn.Module):
             "node_embeddings": h_dict,
             "attention_weights": attention_weights,
         }
+        g_emb = self._global_graph_embedding(g, h_dict)
+        obs_emb = self._global_observation_embedding(g)
+        why_today_input = torch.cat([g_emb, obs_emb], dim=1)
+        g_lat = self.global_latent_head(g_emb)
+        g_unc = F.softplus(self.global_latent_uncertainty_head(g_emb))
+        g_alpha = self.global_temporal_gate(g_emb)
+        g_prev = self._global_prev_latent(g)
+        g_curr = torch.tanh(g_lat)
+        if g_prev is not None and g_prev.shape == g_curr.shape:
+            g_state = (1.0 - g_alpha) * g_prev + g_alpha * g_curr
+        else:
+            g_state = g_curr
+        outputs.update(
+            {
+                "global_bridge_state": g_state[:, 0],
+                "global_signaling_state": g_state[:, 1],
+                "global_crosstalk_state": g_state[:, 2],
+                "global_bridge_state_std": torch.clamp(g_unc[:, 0], min=1e-4),
+                "global_signaling_state_std": torch.clamp(g_unc[:, 1], min=1e-4),
+                "global_crosstalk_state_std": torch.clamp(g_unc[:, 2], min=1e-4),
+                "global_temporal_alpha_bridge": g_alpha[:, 0],
+                "global_temporal_alpha_signaling": g_alpha[:, 1],
+                "global_temporal_alpha_crosstalk": g_alpha[:, 2],
+            }
+        )
+        why_today_logits = self.why_today_latent_head(why_today_input)
+        why_today_obs_logits = self.why_today_obs_only_head(obs_emb)
+        why_today_obs_gate = torch.sigmoid(self.why_today_obs_gate(why_today_input))
+        why_today_family_logits = self.why_today_family_head(why_today_input)
+        why_today_family_probs = torch.softmax(why_today_family_logits, dim=1)
+        family_bias = torch.matmul(why_today_family_probs, self.why_today_family_to_latent)
+        why_today_logits = why_today_logits + why_today_obs_gate * why_today_obs_logits + self.why_today_family_bias_scale * family_bias
+        why_today_conf = torch.sigmoid(self.why_today_confidence_head(why_today_input))
+        outputs["why_today_obs_only_logits"] = why_today_obs_logits
+        outputs["why_today_obs_gate"] = why_today_obs_gate
+        outputs["why_today_family_logits"] = why_today_family_logits
+        outputs["why_today_family_probs"] = why_today_family_probs
+        outputs["why_today_latent_logits"] = why_today_logits
+        outputs["why_today_latents"] = torch.sigmoid(why_today_logits)
+        outputs["why_today_latents_conf"] = why_today_conf
+        outputs["posterior_gain"] = torch.sigmoid(self.posterior_gain_head(why_today_input)).reshape(-1)
+        for idx, name in enumerate(WHY_TODAY_LATENT_NAMES):
+            outputs[f"why_today::{name}"] = outputs["why_today_latents"][:, idx]
+            outputs[f"why_today::{name}::conf"] = outputs["why_today_latents_conf"][:, idx]
 
         # modulates: metabolite → enzyme (allosteric effects)
         outputs.update(self._predict_edge_hidden(
@@ -427,6 +643,99 @@ class PathwayGNN(nn.Module):
 
         return outputs
 
+    def _global_observation_embedding(self, g: dgl.DGLHeteroGraph) -> torch.Tensor:
+        for ntype in ("enzyme", "metabolite", "reaction"):
+            if ntype not in g.ntypes or g.num_nodes(ntype) <= 0:
+                continue
+            obs = g.nodes[ntype].data.get("obs")
+            if obs is None or obs.numel() == 0:
+                continue
+            counts = g.batch_num_nodes(ntype) if hasattr(g, "batch_num_nodes") else None
+            if counts is None or counts.numel() == 0:
+                pooled = torch.mean(obs, dim=0, keepdim=True)
+            else:
+                pooled = []
+                off = 0
+                for c in counts.tolist():
+                    cc = int(c)
+                    if cc <= 0:
+                        pooled.append(torch.zeros((obs.shape[-1],), device=obs.device))
+                    else:
+                        pooled.append(torch.mean(obs[off:off + cc], dim=0))
+                    off += max(0, cc)
+                pooled = torch.stack(pooled, dim=0)
+            return torch.relu(self.observation_proj(pooled))
+        return torch.zeros((1, self.cfg.hidden_dim), device=next(self.parameters()).device)
+
+    def _global_graph_embedding(
+        self,
+        g: dgl.DGLHeteroGraph,
+        h_dict: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        parts: list[torch.Tensor] = []
+        for ntype in ("enzyme", "metabolite", "reaction"):
+            h = h_dict.get(ntype)
+            if h is None:
+                continue
+            if h.numel() == 0:
+                bsz = int(g.batch_size) if hasattr(g, "batch_size") else 1
+                parts.append(torch.zeros((bsz, self.cfg.hidden_dim), device=next(self.parameters()).device))
+                continue
+            counts = g.batch_num_nodes(ntype) if hasattr(g, "batch_num_nodes") else None
+            if counts is None or counts.numel() == 0:
+                parts.append(torch.mean(h, dim=0, keepdim=True))
+                continue
+            c0 = int(counts[0].item())
+            bsz = int(counts.numel())
+            if c0 > 0 and int(torch.sum(counts).item()) == h.shape[0]:
+                parts.append(h.view(bsz, c0, -1).mean(dim=1))
+            else:
+                # Fallback for variable-size batching.
+                pooled = []
+                off = 0
+                for c in counts.tolist():
+                    cc = int(c)
+                    if cc <= 0:
+                        pooled.append(torch.zeros((self.cfg.hidden_dim,), device=h.device))
+                    else:
+                        pooled.append(torch.mean(h[off:off + cc], dim=0))
+                    off += max(0, cc)
+                parts.append(torch.stack(pooled, dim=0))
+        if not parts:
+            return torch.zeros((1, self.cfg.hidden_dim * 3), device=next(self.parameters()).device)
+        while len(parts) < 3:
+            parts.append(torch.zeros_like(parts[0]))
+        return torch.cat(parts[:3], dim=1)
+
+    def _global_prev_latent(self, g: dgl.DGLHeteroGraph) -> torch.Tensor | None:
+        if "enzyme" not in g.ntypes:
+            return None
+        n = g.num_nodes("enzyme")
+        if n <= 0:
+            return None
+        if "prev_latent" not in g.nodes["enzyme"].data:
+            return None
+        t = g.nodes["enzyme"].data["prev_latent"]
+        if t.ndim != 2 or t.shape[1] != 3:
+            return None
+        counts = g.batch_num_nodes("enzyme") if hasattr(g, "batch_num_nodes") else None
+        if counts is None or counts.numel() == 0:
+            return torch.mean(t, dim=0, keepdim=True)
+        c0 = int(counts[0].item())
+        bsz = int(counts.numel())
+        if c0 > 0 and int(torch.sum(counts).item()) == t.shape[0]:
+            return t.view(bsz, c0, 3).mean(dim=1)
+        pooled = []
+        off = 0
+        for c in counts.tolist():
+            cc = int(c)
+            if cc <= 0:
+                pooled.append(torch.zeros((3,), device=t.device))
+            else:
+                pooled.append(torch.mean(t[off:off + cc], dim=0))
+            off += max(0, cc)
+        return torch.stack(pooled, dim=0)
+
     def _predict_edge_hidden(
         self,
         g: dgl.DGLHeteroGraph,
@@ -434,7 +743,7 @@ class PathwayGNN(nn.Module):
         etype: str,
         dtype: str,
         h_dict: dict[str, torch.Tensor],
-        head: EdgeHead,
+        head: EdgeHead | MoEEdgeHead,
         name: str,
     ) -> dict[str, torch.Tensor]:
         """Predict hidden states for a learned edge type with semantic gating.
@@ -452,17 +761,32 @@ class PathwayGNN(nn.Module):
         canonical = (stype, etype, dtype)
         if g.num_edges(canonical) == 0:
             empty = torch.tensor([], device=h_dict[stype].device)
-            return {
+            out = {
                 f"{name}_hidden": empty,
                 f"{name}_conf": empty,
                 f"{name}_semantic": empty,
             }
+            if isinstance(head, MoEEdgeHead):
+                out[f"{name}_gate_weights"] = torch.zeros((0, head.num_experts), device=h_dict[stype].device)
+            return out
 
         src, dst = g.edges(etype=canonical)
         src_h = h_dict[stype][src]
         dst_h = h_dict[dtype][dst]
 
-        hidden = head(src_h, dst_h)
+        gate_feat = None
+        if "feat" in g.edges[canonical].data:
+            gate_feat = g.edges[canonical].data["feat"]
+        if "semantic" in g.edges[canonical].data:
+            sem = g.edges[canonical].data["semantic"].float().view(-1, 1)
+            gate_feat = sem if gate_feat is None else torch.cat([gate_feat, sem], dim=1)
+
+        head_out = head(src_h, dst_h, gate_feat=gate_feat) if isinstance(head, MoEEdgeHead) else head(src_h, dst_h)
+        if isinstance(head_out, tuple):
+            hidden, gate_weights = head_out
+        else:
+            hidden = head_out
+            gate_weights = None
         conf = self.confidence_heads[name](src_h, dst_h)
 
         # Residual prediction: clamp(baseline + delta, output_range)
@@ -532,11 +856,14 @@ class PathwayGNN(nn.Module):
                 device=hidden.device,
             )
 
-        return {
+        out = {
             f"{name}_hidden": hidden,
             f"{name}_conf": conf,
             f"{name}_semantic": semantic,
         }
+        if gate_weights is not None:
+            out[f"{name}_gate_weights"] = gate_weights
+        return out
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -687,6 +1014,7 @@ class _HeteroLayer(nn.Module):
         self,
         g: dgl.DGLHeteroGraph,
         h_dict: dict[str, torch.Tensor],
+        rel_graphs: dict[tuple[str, str, str], dgl.DGLHeteroGraph] | None = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor | None]]:
         """Pre-LN Transformer layer: Attention + FFN with residuals.
 
@@ -715,7 +1043,8 @@ class _HeteroLayer(nn.Module):
         for stype, etype, dtype in PHYSICS_ETYPES:
             if g.num_edges((stype, etype, dtype)) == 0:
                 continue
-            sub_g = g[(stype, etype, dtype)]
+            key = (stype, etype, dtype)
+            sub_g = rel_graphs[key] if rel_graphs is not None else g[key]
             conv = self.physics_convs[etype]
             out = conv(sub_g, h_normed[stype], h_normed[dtype])
             agg[dtype].append(out)
@@ -733,7 +1062,8 @@ class _HeteroLayer(nn.Module):
             if g.num_edges((stype, etype, dtype)) == 0:
                 attn[etype] = None
                 continue
-            sub_g = g[(stype, etype, dtype)]
+            key = (stype, etype, dtype)
+            sub_g = rel_graphs[key] if rel_graphs is not None else g[key]
             conv = self.learned_convs[etype]
 
             # Extract edge features if available for this edge type
@@ -755,7 +1085,12 @@ class _HeteroLayer(nn.Module):
                 h_attn[ntype] = h_dict.get(ntype, torch.zeros(0))
                 continue
             if agg[ntype]:
-                msg = torch.stack(agg[ntype]).mean(dim=0)
+                # Avoid stack+mean allocation; sum in-place style and divide once.
+                # This reduces per-layer temporary tensor pressure on CPU training.
+                msg = agg[ntype][0]
+                for extra in agg[ntype][1:]:
+                    msg = msg + extra
+                msg = msg / float(len(agg[ntype]))
             else:
                 msg = torch.zeros_like(h_dict[ntype])
             h_attn[ntype] = h_dict[ntype] + self.dropout(msg)

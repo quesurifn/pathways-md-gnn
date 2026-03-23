@@ -157,6 +157,8 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import os
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -286,6 +288,7 @@ SIGNALING_EDGE_FEAT_DIM = 21
 #
 # Total: 5 + 1 + 1 + 2 + 1 + 4 = 14
 TRANSPORT_EDGE_FEAT_DIM = 14
+REGULATES_EDGE_FEAT_DIM = 13
 
 
 # ---- Graph metadata (exposed for audit/debug) ------------------------------
@@ -348,6 +351,11 @@ class GraphMeta:
     # edge_idx → (src_metabolite_id, dst_metabolite_id)
     transport_idx_to_pair: dict[int, tuple[str, str]] = field(default_factory=dict)
 
+    # regulates edge mappings (for output to Rust)
+    # edge_idx → enzyme_id (source TF and target gene)
+    regulates_idx_to_src: dict[int, str] = field(default_factory=dict)
+    regulates_idx_to_dst: dict[int, str] = field(default_factory=dict)
+
     # P2: receptor_id → enzyme_ids mapping for tissue-context scaling
     receptor_to_enzyme: dict[str, list[str]] = field(default_factory=dict)
     # enzyme_id → compact tissue context features (brain/systemic)
@@ -404,7 +412,15 @@ def _log_zscore_inplace(feat: torch.Tensor, col: int) -> None:
 
 def _id_map(records: list[dict], key: str = "id") -> dict[str, int]:
     """Build {string_id: integer_index} from a list of dicts."""
-    return {r[key]: i for i, r in enumerate(records)}
+    out: dict[str, int] = {}
+    for r in records:
+        rid = r.get(key)
+        if not rid:
+            continue
+        if rid in out:
+            continue
+        out[rid] = len(out)
+    return out
 
 
 def _build_tissue_context(
@@ -550,14 +566,99 @@ def build_graph(cfg: DataConfig | None = None) -> tuple[dgl.DGLHeteroGraph, Grap
     enzymes = _load_jsonl(cfg.enzymes_path)
     metabolites = _load_jsonl(cfg.metabolites_path)
     reactions = _load_jsonl(cfg.reactions_path)
+    substances = _load_jsonl(cfg.substances_path)
+
+    # Load learned-edge files early so we can resolve signaling sources from
+    # canonical substances without heuristic placeholders.
+    reg_recs = _load_jsonl(cfg.edges_regulates_path)
+    sig_recs = _load_jsonl(cfg.edges_signaling_path)
+    bridge_recs = _load_jsonl(cfg.bridges_path)
+
+    # Promote required signaling/bridge source IDs from canonical core entities
+    # into the metabolite node pool when absent from metabolites.jsonl.
+    # This keeps graph semantics data-driven without placeholder rows.
+    sig_source_ids = {
+        str(r.get("signal_substance_id", "")).strip()
+        for r in sig_recs
+        if str(r.get("signal_substance_id", "")).strip()
+    }
+    bridge_mediator_ids = {
+        str(r.get("mediator_id", "")).strip()
+        for r in bridge_recs
+        if r.get("active") is not False and str(r.get("mediator_id", "")).strip()
+    }
+    required_met_source_ids = sig_source_ids | bridge_mediator_ids
+    existing_met_ids = {str(r.get("id", "")).strip() for r in metabolites if str(r.get("id", "")).strip()}
+    enzymes_by_id = {
+        str(r.get("id", "")).strip(): r
+        for r in enzymes
+        if str(r.get("id", "")).strip()
+    }
+    substances_by_id = {
+        str(r.get("id", "")).strip(): r
+        for r in substances
+        if str(r.get("id", "")).strip()
+    }
+    promoted_from_substances = 0
+    promoted_from_enzymes = 0
+    for sid in sorted(required_met_source_ids):
+        if sid in existing_met_ids:
+            continue
+        srow = substances_by_id.get(sid)
+        if srow is not None:
+            metabolites.append(
+                {
+                    "id": sid,
+                    "name": srow.get("name", sid),
+                    "baseline_vol": "",
+                    "source_strength": srow.get("source_strength", "D"),
+                    "source_file": "substances.promoted_for_signaling",
+                }
+            )
+            existing_met_ids.add(sid)
+            promoted_from_substances += 1
+            continue
+
+        erow = enzymes_by_id.get(sid)
+        if erow is not None:
+            metabolites.append(
+                {
+                    "id": sid,
+                    "name": erow.get("name", sid),
+                    "baseline_vol": "",
+                    "source_strength": erow.get("source_strength", "D"),
+                    "source_file": "enzymes.promoted_for_signaling",
+                }
+            )
+            existing_met_ids.add(sid)
+            promoted_from_enzymes += 1
+
+    unresolved_sig_sources = sorted(required_met_source_ids - existing_met_ids)
+    if unresolved_sig_sources:
+        preview = ", ".join(unresolved_sig_sources[:20])
+        allow_unresolved = str(
+            os.getenv("PATHWAYS_GNN_ALLOW_UNRESOLVED_SIGNALING_SOURCES", "0")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if not allow_unresolved:
+            raise ValueError(
+                "Unresolved signaling sources in canonical data: "
+                f"{len(unresolved_sig_sources)} missing (first 20: {preview})"
+            )
+        logger.warning(
+            "Allowing unresolved signaling sources due to "
+            "PATHWAYS_GNN_ALLOW_UNRESOLVED_SIGNALING_SOURCES=1 "
+            "(missing=%d, first_20=%s). "
+            "Affected signaling/bridge rows will be skipped if source IDs are absent.",
+            len(unresolved_sig_sources), preview,
+        )
 
     enz_map = _id_map(enzymes)
     met_map = _id_map(metabolites)
     rxn_map = _id_map(reactions)
 
     logger.info(
-        "Entities: %d enzymes, %d metabolites, %d reactions",
-        len(enz_map), len(met_map), len(rxn_map),
+        "Entities: %d enzymes, %d metabolites, %d reactions (promoted_from_substances=%d, promoted_from_enzymes=%d)",
+        len(enz_map), len(met_map), len(rxn_map), promoted_from_substances, promoted_from_enzymes,
     )
 
     # -- Load pathway data (informational, not used for routing) -------------
@@ -587,16 +688,24 @@ def build_graph(cfg: DataConfig | None = None) -> tuple[dgl.DGLHeteroGraph, Grap
     part_recs = _load_jsonl(cfg.edges_reaction_participants_path)
     cof_recs = _load_jsonl(cfg.edges_cofactor_path)
     mod_recs = _load_jsonl(cfg.edges_modulates_path)
-    reg_recs = _load_jsonl(cfg.edges_regulates_path)
-    sig_recs = _load_jsonl(cfg.edges_signaling_path)
-    bridge_recs = _load_jsonl(cfg.bridges_path)
+    # Already loaded above (needed for strict signaling source resolution).
+    reg_dyn_recs = _load_jsonl(cfg.regulatory_dynamics_path)
     # P1: Load regulatory kinetics for quantitative modulation features
     reg_kinetics_recs = _load_jsonl(cfg.regulatory_kinetics_path)
     # P1: Load transport/BBB for compartmentalization
     transport_recs = _load_jsonl(cfg.edges_transport_path)
     bbb_recs = _load_jsonl(cfg.edges_bbb_path)
-    # P1: Load inhibitors for competitive inhibition edges
-    inhibitor_recs = _load_jsonl(cfg.inhibitors_path)
+    # Inhibitor rows were historically kept in a standalone kinetics file.
+    # Canonical now carries inhibitor actions primarily via edges_modulates and
+    # regulatory_kinetics. Keep standalone loading optional for compatibility.
+    if cfg.inhibitors_path.exists():
+        inhibitor_recs = _load_jsonl(cfg.inhibitors_path)
+    else:
+        inhibitor_recs = []
+        logger.info(
+            "No standalone inhibitors file at %s; using canonical modulates/regulatory_kinetics only",
+            cfg.inhibitors_path,
+        )
     # P2: Load receptor expression context for tissue-specific scaling
     receptor_expression_recs = _load_jsonl(cfg.receptor_expression_path)
     # NOTE: edges_affects.jsonl is NOT loaded here - SNP personalization is
@@ -621,13 +730,46 @@ def build_graph(cfg: DataConfig | None = None) -> tuple[dgl.DGLHeteroGraph, Grap
     # -- Learned edges -------------------------------------------------------
     # P1: Modulates edges now include 13-dim regulatory kinetics features
     # for quantitative attention biasing based on EC50/IC50/Kd/Ki values.
-    # Also includes competitive inhibitors from inhibitors.jsonl.
+    # Standalone inhibitor rows are optional; canonical inhibitor actions are
+    # represented through edges_modulates/regulatory_kinetics.
     mod_s, mod_d, mod_idx_to_src, mod_idx_to_dst, mod_edge_feats = _modulates_edges(
         mod_recs, reg_kinetics_recs, inhibitor_recs, met_map, enz_map
     )
     # Regulates: use _filtered_pairs_with_ids so we can tag per-edge semantics
-    reg_s, reg_d, reg_idx_to_src, reg_idx_to_dst = _filtered_pairs_with_ids(
-        reg_recs, "tf_id", "target_gene_id", enz_map, enz_map
+    known_substance_ids = {
+        str(r.get("id", "")).strip()
+        for r in substances
+        if str(r.get("id", "")).strip()
+    }
+    known_substance_ids.update(
+        {
+            str(r.get("id", "")).strip()
+            for r in metabolites
+            if str(r.get("id", "")).strip()
+        }
+    )
+    known_substance_ids.update(
+        {
+            str(r.get("id", "")).strip()
+            for r in enzymes
+            if str(r.get("id", "")).strip()
+        }
+    )
+    bridge_target_enzyme_by_id: dict[str, str] = {}
+    for br in bridge_recs:
+        bid = str(br.get("bridge_id", "")).strip()
+        if not bid:
+            continue
+        target_enz = str(br.get("target_enzyme_id", "")).strip()
+        if target_enz:
+            bridge_target_enzyme_by_id[bid] = target_enz
+
+    reg_s, reg_d, reg_idx_to_src, reg_idx_to_dst, reg_edge_feats = _regulates_edges(
+        reg_recs,
+        reg_dyn_recs,
+        enz_map,
+        known_substance_ids=known_substance_ids,
+        bridge_target_enzyme_by_id=bridge_target_enzyme_by_id,
     )
 
     # Signaling: signal_substance → bridge_mediator (via target_bridge_id lookup)
@@ -670,7 +812,11 @@ def build_graph(cfg: DataConfig | None = None) -> tuple[dgl.DGLHeteroGraph, Grap
         "metabolite": len(met_map),
         "reaction": len(rxn_map),
     }
-    g = dgl.heterograph(graph_data, num_nodes_per_type=num_nodes)
+    # DGL 2.x uses num_nodes_per_type; DGL 1.x uses num_nodes_dict.
+    try:
+        g = dgl.heterograph(graph_data, num_nodes_per_type=num_nodes)
+    except TypeError:
+        g = dgl.heterograph(graph_data, num_nodes_dict=num_nodes)
 
     # -- Attach edge features -------------------------------------------------
     # Bridge edges: evidence-based features (10 dims)
@@ -679,6 +825,8 @@ def build_graph(cfg: DataConfig | None = None) -> tuple[dgl.DGLHeteroGraph, Grap
     g.edges[("metabolite", "signaling", "metabolite")].data["feat"] = sig_edge_feats
     # P1: Modulates edges: regulatory kinetics features (13 dims)
     g.edges[("metabolite", "modulates", "enzyme")].data["feat"] = mod_edge_feats
+    # Regulates edges: transcription/dynamic features (13 dims)
+    g.edges[("enzyme", "regulates", "enzyme")].data["feat"] = reg_edge_feats
     # P1: Transport edges: compartment transport features (14 dims)
     g.edges[("metabolite", "transports_to", "metabolite")].data["feat"] = trans_edge_feats
 
@@ -743,7 +891,10 @@ def build_graph(cfg: DataConfig | None = None) -> tuple[dgl.DGLHeteroGraph, Grap
     GRADE_MAP = {"A": 1.0, "B": 0.75, "C": 0.5, "D": 0.25}
 
     # Enzyme: [baseline_km, baseline_vmax, kcat, source_grade, brain_expr_norm, brain:systemic_ratio]
-    enz_feat = torch.zeros(len(enz_map), 6)
+    # Use max mapped index + 1 (not len(map)) because duplicate IDs in source
+    # files can create sparse index spaces when a later duplicate overwrites a key.
+    enz_n = (max(enz_map.values()) + 1) if enz_map else 0
+    enz_feat = torch.zeros(enz_n, 6)
     for enz in enzymes:
         i = enz_map[enz["id"]]
         enz_feat[i, 0] = _safe_float(enz.get("baseline_km"))
@@ -765,7 +916,8 @@ def build_graph(cfg: DataConfig | None = None) -> tuple[dgl.DGLHeteroGraph, Grap
     g.nodes["enzyme"].data["feat"] = enz_feat
 
     # Metabolite: [baseline_vol, source_grade]
-    met_feat = torch.zeros(len(met_map), 2)
+    met_n = (max(met_map.values()) + 1) if met_map else 0
+    met_feat = torch.zeros(met_n, 2)
     for met in metabolites:
         i = met_map[met["id"]]
         met_feat[i, 0] = _safe_float(met.get("baseline_vol"))
@@ -777,7 +929,8 @@ def build_graph(cfg: DataConfig | None = None) -> tuple[dgl.DGLHeteroGraph, Grap
     g.nodes["metabolite"].data["feat"] = met_feat
 
     # Reaction: [reversible_flag, source_grade]
-    rxn_feat = torch.zeros(len(rxn_map), 2)
+    rxn_n = (max(rxn_map.values()) + 1) if rxn_map else 0
+    rxn_feat = torch.zeros(rxn_n, 2)
     for rxn in reactions:
         i = rxn_map[rxn["id"]]
         rxn_feat[i, 0] = 1.0 if rxn.get("reversible") == "true" else 0.0
@@ -805,6 +958,8 @@ def build_graph(cfg: DataConfig | None = None) -> tuple[dgl.DGLHeteroGraph, Grap
         bridges=bridge_meta,
         modulates_idx_to_src=mod_idx_to_src,
         modulates_idx_to_dst=mod_idx_to_dst,
+        regulates_idx_to_src=reg_idx_to_src,
+        regulates_idx_to_dst=reg_idx_to_dst,
         transport_idx_to_pair=trans_idx_to_pair,  # P1: edge idx → (src, dst) metabolite IDs
         receptor_to_enzyme=receptor_to_enzyme,
         enzyme_tissue_context=enzyme_tissue_context,
@@ -884,7 +1039,11 @@ def _signaling_edges(
         mediator = bridge_to_mediator.get(target_bid, "")
         dst_idx = met_map.get(mediator)
 
-        if src_idx is not None and dst_idx is not None and src_idx != dst_idx:
+        # Keep self-loop signaling edges. In this seed set many valid
+        # crosstalk records map signal_substance -> mediator where IDs match
+        # (autocrine/self-context effects). Dropping self loops would zero out
+        # the signaling channel entirely.
+        if src_idx is not None and dst_idx is not None:
             srcs.append(src_idx)
             dsts.append(dst_idx)
 
@@ -929,6 +1088,138 @@ def _signaling_edges(
         len(srcs), edge_feats.shape[1] if edge_feats.numel() > 0 else SIGNALING_EDGE_FEAT_DIM
     )
     return srcs, dsts, edge_feats
+
+
+def _regulates_edges(
+    reg_recs: list[dict],
+    reg_dyn_recs: list[dict],
+    enz_map: dict[str, int],
+    known_substance_ids: set[str] | None = None,
+    bridge_target_enzyme_by_id: dict[str, str] | None = None,
+) -> tuple[list[int], list[int], dict[int, str], dict[int, str], torch.Tensor]:
+    """Create enzyme->enzyme regulates edges with dynamics-aware features.
+
+    Feature dims (13):
+    - direction one-hot: increased/decreased/mixed/unknown (4)
+    - mechanism one-hot: transcriptional/phospho/degradation/other (4)
+    - source_strength one-hot: A/B/C/D (4)
+    - dynamic scalar (0..1) from regulatory_dynamics target match (1)
+    """
+    known_substance_ids = known_substance_ids or set()
+    bridge_target_enzyme_by_id = bridge_target_enzyme_by_id or {}
+
+    # Build regulator -> downstream enzyme targets from curated regulates edges.
+    # This lets receptor/signaling dynamics inform enzyme-directed regulation
+    # only when an explicit curated path exists in canonical edges.
+    downstream_enz_by_regulator: dict[str, set[str]] = defaultdict(set)
+    for row in reg_recs:
+        reg_id = str(row.get("tf_id", row.get("regulator_id", ""))).strip()
+        dst_id = str(row.get("target_gene_id", row.get("target_id", ""))).strip()
+        if reg_id and dst_id in enz_map:
+            downstream_enz_by_regulator[reg_id].add(dst_id)
+
+    dyn_vals_by_target: dict[str, list[float]] = defaultdict(list)
+    dyn_stats = {
+        "rows_total": 0,
+        "rows_with_numeric_value": 0,
+        "rows_substance_unresolved": 0,
+        "rows_direct_enzyme_target": 0,
+        "rows_projected_via_regulates": 0,
+        "rows_unmapped_target": 0,
+    }
+    for r in reg_dyn_recs:
+        dyn_stats["rows_total"] += 1
+        sid = str(r.get("substance_id", "")).strip()
+        if sid and known_substance_ids and sid not in known_substance_ids:
+            dyn_stats["rows_substance_unresolved"] += 1
+        tgt = str(r.get("target_id", "")).strip()
+        tgt_type = str(r.get("target_type", "")).strip().lower()
+        if not tgt:
+            continue
+        try:
+            v = float(r.get("value", 0.0))
+        except Exception:
+            continue
+        if not (v == v) or abs(v) > 1e12:
+            continue
+        dyn_stats["rows_with_numeric_value"] += 1
+        dyn_val = float(torch.sigmoid(torch.tensor(math.log10(abs(v) + 1.0))).item())
+        if tgt in enz_map:
+            dyn_vals_by_target[tgt].append(dyn_val)
+            dyn_stats["rows_direct_enzyme_target"] += 1
+            continue
+        if tgt_type == "bridge":
+            enz_tgt = bridge_target_enzyme_by_id.get(tgt, "")
+            if enz_tgt and enz_tgt in enz_map:
+                dyn_vals_by_target[enz_tgt].append(dyn_val)
+                dyn_stats["rows_projected_via_regulates"] += 1
+                continue
+        projected = downstream_enz_by_regulator.get(tgt, set())
+        if projected:
+            for enz_id in projected:
+                dyn_vals_by_target[enz_id].append(dyn_val)
+            dyn_stats["rows_projected_via_regulates"] += 1
+        else:
+            dyn_stats["rows_unmapped_target"] += 1
+
+    srcs: list[int] = []
+    dsts: list[int] = []
+    idx_to_src: dict[int, str] = {}
+    idx_to_dst: dict[int, str] = {}
+    feat_rows: list[list[float]] = []
+
+    for row in reg_recs:
+        src_id = str(row.get("tf_id", "")).strip()
+        dst_id = str(row.get("target_gene_id", "")).strip()
+        s = enz_map.get(src_id)
+        d = enz_map.get(dst_id)
+        if s is None or d is None:
+            continue
+        edge_idx = len(srcs)
+        srcs.append(s)
+        dsts.append(d)
+        idx_to_src[edge_idx] = src_id
+        idx_to_dst[edge_idx] = dst_id
+
+        direction = str(row.get("effect_direction", row.get("direction", "unknown"))).lower()
+        dir_vec = [
+            1.0 if direction == "increased" else 0.0,
+            1.0 if direction == "decreased" else 0.0,
+            1.0 if direction == "mixed" else 0.0,
+            1.0 if direction not in {"increased", "decreased", "mixed"} else 0.0,
+        ]
+        mech = str(row.get("mechanism", "other")).lower()
+        mech_vec = [
+            1.0 if mech == "transcriptional_regulation" else 0.0,
+            1.0 if "phospho" in mech else 0.0,
+            1.0 if "degrad" in mech else 0.0,
+            1.0 if mech not in {"transcriptional_regulation"} and ("phospho" not in mech) and ("degrad" not in mech) else 0.0,
+        ]
+        ss = str(row.get("source_strength", "D")).upper()
+        grade_vec = [
+            1.0 if ss == "A" else 0.0,
+            1.0 if ss == "B" else 0.0,
+            1.0 if ss == "C" else 0.0,
+            1.0 if ss == "D" else 0.0,
+        ]
+        dv = dyn_vals_by_target.get(dst_id, [])
+        dyn_scalar = float(sum(dv) / len(dv)) if dv else 0.0
+        feat_rows.append(dir_vec + mech_vec + grade_vec + [dyn_scalar])
+
+    if feat_rows:
+        feats = torch.tensor(feat_rows, dtype=torch.float32)
+    else:
+        feats = torch.zeros((0, REGULATES_EDGE_FEAT_DIM), dtype=torch.float32)
+    logger.info(
+        "Regulatory dynamics linkage: total=%d numeric=%d direct_enzyme=%d projected_via_regulates=%d unmapped_target=%d unresolved_substance=%d",
+        dyn_stats["rows_total"],
+        dyn_stats["rows_with_numeric_value"],
+        dyn_stats["rows_direct_enzyme_target"],
+        dyn_stats["rows_projected_via_regulates"],
+        dyn_stats["rows_unmapped_target"],
+        dyn_stats["rows_substance_unresolved"],
+    )
+    return srcs, dsts, idx_to_src, idx_to_dst, feats
 
 
 # ---------------------------------------------------------------------------
@@ -1370,8 +1661,7 @@ def _bridge_edges(
         bridge_id = br.get("bridge_id", "")
         mediator_id = br.get("mediator_id", "")
 
-        # Extract target enzyme from bridge_id (e.g., "SAMe_HNMT" → "HNMT")
-        target_enzyme = bridge_id.rsplit("_", 1)[-1] if "_" in bridge_id else ""
+        target_enzyme = str(br.get("target_enzyme_id", "")).strip()
 
         med_idx = met_map.get(mediator_id)
         enz_idx = enz_map.get(target_enzyme)
@@ -1380,7 +1670,7 @@ def _bridge_edges(
             logger.debug("Bridge %s: mediator %s not in metabolites", bridge_id, mediator_id)
             continue
         if enz_idx is None:
-            logger.debug("Bridge %s: enzyme %s not in enzymes", bridge_id, target_enzyme)
+            logger.debug("Bridge %s: target_enzyme_id %s not in enzymes", bridge_id, target_enzyme)
             continue
 
         edge_idx = len(srcs)

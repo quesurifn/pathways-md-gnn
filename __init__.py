@@ -16,7 +16,7 @@ Architecture:
 
 __version__ = "0.3.0"
 
-from .calibrate import calibrate  # noqa: F401 — public API
+from .calibrate import calibrate, calibrate_or_default  # noqa: F401 — public API
 from .audit import AuditTrace  # noqa: F401
 from .model import PathwayGNN  # noqa: F401
 

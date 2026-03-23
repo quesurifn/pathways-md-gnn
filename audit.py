@@ -22,6 +22,16 @@ class EdgeAttribution:
 
 
 @dataclass
+class ResolvedEdge:
+    """An edge with human-readable source/destination entity IDs."""
+
+    edge_type: str
+    src_id: str
+    dst_id: str
+    attention: float
+
+
+@dataclass
 class AttentionSummary:
     """Per-edge-type attention weight summary from GAT layers.
 
@@ -34,6 +44,7 @@ class AttentionSummary:
     mean_attention: float
     max_attention: float
     top_edge_indices: list[int]  # Edges with highest attention
+    top_attention_edges: list[ResolvedEdge] = field(default_factory=list)
 
 
 @dataclass
@@ -79,6 +90,15 @@ class AuditTrace:
                     "mean_attention": round(a.mean_attention, 4),
                     "max_attention": round(a.max_attention, 4),
                     "top_edge_indices": a.top_edge_indices[:10],
+                    "top_attention_edges": [
+                        {
+                            "edge_type": e.edge_type,
+                            "src_id": e.src_id,
+                            "dst_id": e.dst_id,
+                            "attention": round(e.attention, 4),
+                        }
+                        for e in a.top_attention_edges
+                    ],
                 }
                 for a in self.attention_summary
             ],

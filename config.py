@@ -247,8 +247,9 @@ class ModelConfig:
     signaling_edge_feat_dim: int = 21
 
     # ─────────────────────────────────────────────────────────────────────────
-    # NOTE: SNP personalization is handled OUTSIDE the GNN via lookup tables.
-    # The GNN learns wild type biochemistry; SNPs are post-GNN multipliers.
+    # NOTE: SNP personalization is handled OUTSIDE the GNN in the DAG prior.
+    # The GNN consumes a genotype-aware prior packet and predicts bounded
+    # current-state corrections on top of that prior.
     # See personalization-architecture.md for the full design rationale.
     #
     # - variant_kinetics.jsonl: SNP→enzyme multipliers (used in Rust engine)
@@ -299,6 +300,9 @@ class ModelConfig:
     # - Swinney (2011) Nat Rev Drug Discov "Biochemical mechanisms of drug action"
     # ─────────────────────────────────────────────────────────────────────────
     modulates_edge_feat_dim: int = 13
+    # Regulates edge features (from regulatory_dynamics.jsonl + canonical metadata):
+    # [direction one-hot 4, mechanism one-hot 4, source_strength one-hot 4, dynamic scalar 1]
+    regulates_edge_feat_dim: int = 13
 
     # ─────────────────────────────────────────────────────────────────────────
     # P1: Transport Edge Features (Compartmentalization)
@@ -332,6 +336,18 @@ class ModelConfig:
     # The bottleneck forces learning compact edge representations.
     # ─────────────────────────────────────────────────────────────────────────
     edge_head_hidden_dim: int = 32  # MLP hidden dim in edge heads
+    # Domain-MoE edge heads (data-driven split):
+    # - enzyme_regulation: modulates + regulates
+    # - cofactor_bridge: bridges
+    # - crosstalk_signaling: signaling
+    # - transport_context: transports_to
+    use_moe_heads: bool = True
+    enzyme_regulation_experts: int = 4
+    cofactor_bridge_experts: int = 3
+    crosstalk_signaling_experts: int = 4
+    transport_context_experts: int = 2
+    moe_gate_hidden_dim: int = 32
+    moe_gate_dropout: float = 0.05
 
     # ─────────────────────────────────────────────────────────────────────────
     # Output Ranges per Learned Edge Type
@@ -447,6 +463,14 @@ class ModelConfig:
     lambda_smooth: float = 1.0      # prefer small hidden states
     lambda_bridge: float = 5.0      # bridge coherence
     lambda_confidence: float = 0.1  # confidence calibration
+    lambda_global_latent: float = 2.0  # direct posterior latent supervision
+    lambda_teacher_distill: float = 1.0  # teacher-student loss for Why-Today latent heads
+    lambda_posterior_gain: float = 0.5  # reward predicted posterior lift over baseline
+    lambda_coupling: float = 0.2  # signaling->bridge->enzyme consistency
+    lambda_top_driver: float = 1.0  # force Why-Today top driver separation
+    lambda_contrastive_driver: float = 0.5  # hard-pair ranking pressure for confused driver pairs
+    lambda_family_driver: float = 0.35  # syndrome-family hierarchy for Why-Today latent competition
+    contrastive_driver_margin: float = 0.15  # minimum logit gap between paired drivers
 
 
 # ---------------------------------------------------------------------------
@@ -618,7 +642,7 @@ class DataConfig:
     # SNP PERSONALIZATION — NOT IN GNN (explainability only)
     #
     # SNP personalization is handled OUTSIDE the GNN via lookup tables.
-    # The GNN learns wild type biochemistry; SNPs are post-GNN multipliers.
+    # The GNN predicts posterior corrections over a genotype-aware DAG prior.
     # See personalization-architecture.md for the full design rationale.
     # =========================================================================
 
@@ -754,3 +778,35 @@ class DataConfig:
         TODO: Use for phenotype prediction supervision.
         """
         return self.seed_root / "kinetics" / "variant_outcomes.jsonl"
+
+    @property
+    def lifestyle_factors_path(self) -> Path:
+        """Lifestyle factor definitions (sleep, stress, diet, etc.)."""
+        return self.seed_root / "core" / "lifestyle_factors.jsonl"
+
+    @property
+    def lifestyle_expression_effects_path(self) -> Path:
+        """Lifestyle factor → enzyme expression effects.
+
+        Maps factor_id (e.g. LIFESTYLE_SLEEP_CIRCADIAN) to target_id (enzyme)
+        with direction (increased/decreased). Used for per-node lifestyle context.
+        """
+        return self.seed_root / "kinetics" / "lifestyle_expression_effects.jsonl"
+
+    @property
+    def effector_symptom_links_path(self) -> Path:
+        """Symptom → effector state links for GNN context conditioning.
+
+        Contains symptom_id → effector_state_id mappings with weight and
+        direction. Used to encode symptom burden into per-node context.
+        """
+        return self.seed_root / "phenotype" / "effector_symptom_links.jsonl"
+
+    @property
+    def effector_states_path(self) -> Path:
+        """Effector states with mechanism_ids (enzymes) and aliases (metabolites).
+
+        Maps effector_state_id → mechanism_ids (enzyme/gene IDs) + aliases
+        (metabolite IDs). Used to resolve symptom → enzyme/metabolite relevance.
+        """
+        return self.seed_root / "phenotype" / "effector_states.jsonl"

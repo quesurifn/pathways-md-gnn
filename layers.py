@@ -171,12 +171,10 @@ class KineticConv(nn.Module):
             # Step 1: Compute per-edge modifier (PINN learns this)
             graph.apply_edges(self._edge_modifier)
 
-            # Step 2: Message = hidden_state × modifier
-            # This is the physics-informed part: modifier scales the signal
-            graph.edata["msg"] = graph.edata["modifier"] * graph.srcdata["h"]
-
-            # Step 3: Aggregate with mean (degree-normalized)
-            graph.update_all(fn.copy_e("msg", "m"), fn.mean("m", "out"))
+            # Step 2+3: Message = hidden_state × modifier, aggregate with mean.
+            # Use DGL built-ins (u_mul_e) so source-node/edge alignment is handled
+            # correctly across DGL versions.
+            graph.update_all(fn.u_mul_e("h", "modifier", "m"), fn.mean("m", "out"))
             return graph.dstdata["out"]
 
     def _edge_modifier(self, edges: dgl.udf.EdgeBatch) -> dict:
@@ -463,6 +461,78 @@ class EdgeHead(nn.Module):
         return scaled
 
 
+class MoEEdgeHead(nn.Module):
+    """Mixture-of-experts edge head with soft routing.
+
+    This head is used to separate biologically distinct edge families while
+    preserving a shared trunk. It returns both predictions and gate weights
+    for audit/debugging.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        output_range: tuple[float, float],
+        num_experts: int,
+        gate_hidden_dim: int = 32,
+        gate_feat_dim: int = 0,
+        dropout: float = 0.1,
+        gate_dropout: float = 0.05,
+    ) -> None:
+        super().__init__()
+        self.output_lo, self.output_hi = output_range
+        self.num_experts = max(1, int(num_experts))
+        self.gate_feat_dim = max(0, int(gate_feat_dim))
+        self.experts = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(input_dim, hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(hidden_dim, 1),
+                )
+                for _ in range(self.num_experts)
+            ]
+        )
+        self.router = nn.Sequential(
+            nn.Linear(input_dim + self.gate_feat_dim, max(8, int(gate_hidden_dim))),
+            nn.ReLU(),
+            nn.Dropout(gate_dropout),
+            nn.Linear(max(8, int(gate_hidden_dim)), self.num_experts),
+        )
+
+    def forward(
+        self,
+        src_h: torch.Tensor,
+        dst_h: torch.Tensor,
+        gate_feat: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        pair = torch.cat([src_h, dst_h], dim=-1)
+        if self.gate_feat_dim > 0:
+            if gate_feat is None:
+                gf = torch.zeros((pair.shape[0], self.gate_feat_dim), dtype=pair.dtype, device=pair.device)
+            else:
+                gf = gate_feat
+                if gf.ndim == 1:
+                    gf = gf.view(-1, 1)
+                if gf.shape[1] < self.gate_feat_dim:
+                    pad = torch.zeros((gf.shape[0], self.gate_feat_dim - gf.shape[1]), dtype=gf.dtype, device=gf.device)
+                    gf = torch.cat([gf, pad], dim=1)
+                elif gf.shape[1] > self.gate_feat_dim:
+                    gf = gf[:, : self.gate_feat_dim]
+            router_in = torch.cat([pair, gf], dim=-1)
+        else:
+            router_in = pair
+
+        gate_logits = self.router(router_in)
+        gate = torch.softmax(gate_logits, dim=-1)
+        expert_raw = torch.cat([ex(pair) for ex in self.experts], dim=-1)  # (N, E)
+        raw = torch.sum(gate * expert_raw, dim=-1)
+        scaled = torch.sigmoid(raw) * (self.output_hi - self.output_lo) + self.output_lo
+        return scaled, gate
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 4. Confidence Head — per-edge confidence prediction
 # ═══════════════════════════════════════════════════════════════════════════
@@ -530,4 +600,3 @@ class ConfidenceHead(nn.Module):
         """
         pair = torch.cat([src_h, dst_h], dim=-1)
         return self.mlp(pair).squeeze(-1)
-
